@@ -129,83 +129,213 @@ class GroundedResponse(BaseModel):
     answerable: bool
 
 
+Q3_STOPWORDS = STOPWORDS | {
+    "answer", "according", "context", "chunk", "information", "tell", "please",
+    "many", "much", "name", "called", "kind", "type", "use", "used",
+}
+Q3_QUESTION_STARTERS = {
+    "What", "Which", "Who", "Whom", "Whose", "When", "Where", "Why", "How",
+    "Is", "Are", "Was", "Were", "Did", "Does", "Do", "Can", "Could", "Would",
+}
+NUMBER_WORDS = {
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+    "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million",
+}
+Q3_RELATION_GROUPS: dict[str, set[str]] = {
+    "release": {"release", "launch", "publish", "opensource", "open", "source"},
+    "develop": {"develop", "create", "build", "design", "invent"},
+    "found": {"found", "establish", "start"},
+    "author": {"author", "write", "wrote", "written", "publish"},
+    "integrate": {"integrate", "connect", "support", "compatible", "work"},
+    "hire": {"hire", "employ", "recruit", "join"},
+    "language": {"language", "written", "implement", "code"},
+    "location": {"where", "located", "based", "headquarter"},
+}
+
+
 def sentence_candidates(chunk: ContextChunk) -> list[str]:
-    pieces = [s.strip() for s in SENTENCE_RE.split(chunk.text.strip()) if s.strip()]
+    # Keep the supporting text verbatim except for surrounding whitespace.
+    pieces = [s.strip() for s in re.split(r"[.!?]\s+", chunk.text.strip()) if s.strip()]
     return pieces or [chunk.text.strip()]
 
 
-def q3_candidate_score(question: str, sentence: str) -> tuple[float, float, int]:
-    q_terms = expanded_content_tokens(question)
-    s_terms = expanded_content_tokens(sentence)
-    if not q_terms:
-        return 0.0, 0.0, 0
-    overlap = len(q_terms & s_terms)
-    coverage = overlap / len(q_terms)
-    precision = overlap / len(s_terms) if s_terms else 0.0
+def q3_stems(text: str, *, remove_stopwords: bool = False) -> list[str]:
+    result: list[str] = []
+    for token in tokens(text):
+        if remove_stopwords and token in Q3_STOPWORDS:
+            continue
+        result.append(stem(token.replace("-", "")))
+    return result
 
-    # Capitalized/acronym terms usually identify the subject being asked about.
-    # Weight them more heavily than generic relation words such as "released".
-    named_terms = {
-        token.lower()
-        for token in re.findall(r"\b(?:[A-Z]{2,}[A-Za-z0-9-]*|[A-Z][a-z]+[A-Z][A-Za-z0-9-]*)\b", question)
+
+def q3_named_anchors(question: str) -> list[str]:
+    anchors: list[str] = []
+    # Quoted phrases are always important anchors.
+    anchors.extend(m.group(1).strip() for m in re.finditer(r'["“]([^"”]+)["”]', question))
+
+    # Capture ordinary names too (Anthropic, Rust), not only acronyms/CamelCase.
+    proper = re.compile(
+        r"\b(?:[A-Z][A-Za-z0-9+#.-]*)(?:\s+(?:(?:of|the|and|for)\s+)?[A-Z][A-Za-z0-9+#.-]*)*\b"
+    )
+    for match in proper.finditer(question):
+        phrase = match.group(0).strip()
+        first = phrase.split()[0]
+        if first in Q3_QUESTION_STARTERS:
+            phrase = " ".join(phrase.split()[1:]).strip()
+        if phrase and phrase not in Q3_QUESTION_STARTERS and phrase.lower() not in Q3_STOPWORDS:
+            anchors.append(phrase)
+
+    # Deduplicate while preserving order.
+    return list(dict.fromkeys(a for a in anchors if a))
+
+
+def q3_relation_keys(text: str) -> set[str]:
+    lower = text.lower()
+    patterns: dict[str, str] = {
+        "release": r"\b(?:releas\w*|launch\w*|publish\w*|open[- ]?sourc\w*)\b",
+        "develop": r"\b(?:develop\w*|creat\w*|built|build\w*|design\w*|invent\w*)\b",
+        "found": r"\b(?:found(?:ed|er)?|establish\w*|start\w*)\b",
+        "author": r"\b(?:author\w*|wrote|written|write\w*|publish\w*)\b",
+        "integrate": r"\b(?:integrat\w*|connect\w*|support\w*|compatib\w*|works?)\b",
+        "hire": r"\b(?:hir\w*|employ\w*|recruit\w*|join\w*)\b",
+        "language": r"\b(?:language|written|implement\w*|cod\w*)\b",
+        "location": r"\b(?:where|locat\w*|based|headquarter\w*)\b",
     }
-    sentence_raw_tokens = set(tokens(sentence))
-    named_overlap = len(named_terms & sentence_raw_tokens)
+    return {key for key, pattern in patterns.items() if re.search(pattern, lower)}
 
-    q_lower = question.lower()
-    bonus = 0.35 * named_overlap
-    if re.search(r"\b(what|which)\s+year\b|\bwhen\b", q_lower) and re.search(r"\b(?:19|20)\d{2}\b", sentence):
-        bonus += 0.25
-    if re.search(r"\bhow many\b|\bwhat (?:percent|percentage|amount|number)\b", q_lower) and re.search(
-        r"\b\d+(?:\.\d+)?%?\b", sentence
-    ):
-        bonus += 0.20
-    if re.search(r"\bwho\b", q_lower) and re.search(r"\b[A-Z][A-Za-z0-9.-]+(?:\s+[A-Z][A-Za-z0-9.-]+)+\b", sentence):
-        bonus += 0.10
 
-    score = 0.62 * coverage + 0.23 * precision + bonus
-    return score, coverage, overlap
+def q3_answer_type(question: str) -> str:
+    q = question.lower()
+    if re.search(r"\b(?:what|which)\s+year\b|\bwhen\b", q):
+        return "year"
+    if re.search(r"\bhow many\b|\bhow much\b|\b(?:what|which)\s+(?:percent|percentage|amount|number|quantity)\b", q):
+        return "number"
+    if re.search(r"\bwho\b|\bwhom\b|\bwhose\b", q):
+        return "person"
+    if re.search(r"\bwhere\b|\bwhat location\b|\bwhich location\b", q):
+        return "location"
+    if re.search(r"\bwhat language\b|\bwhich language\b", q):
+        return "language"
+    return "general"
+
+
+def q3_type_evidence(answer_type: str, sentence: str, anchors: list[str]) -> float:
+    lower = sentence.lower()
+    if answer_type == "year":
+        return 1.0 if re.search(r"\b(?:18|19|20|21)\d{2}\b", sentence) else 0.0
+    if answer_type == "number":
+        if re.search(r"\b\d+(?:\.\d+)?(?:%|\s*percent)?\b", lower):
+            return 1.0
+        return 0.7 if set(tokens(lower)) & NUMBER_WORDS else 0.0
+    if answer_type == "person":
+        proper = q3_named_anchors(sentence)
+        anchor_norm = {a.lower() for a in anchors}
+        return 1.0 if any(p.lower() not in anchor_norm and len(p.split()) >= 2 for p in proper) else 0.0
+    if answer_type == "location":
+        return 1.0 if re.search(r"\b(?:in|at|from|based in|located in|headquartered in)\b", lower) else 0.0
+    if answer_type == "language":
+        return 1.0 if re.search(r"\b(?:written|implemented|coded|built)\s+in\b|\blanguage\b", lower) else 0.0
+    return 1.0
+
+
+def q3_candidate_score(question: str, sentence: str) -> tuple[float, dict[str, float]]:
+    q_content = set(q3_stems(question, remove_stopwords=True))
+    s_content = set(q3_stems(sentence, remove_stopwords=True))
+    overlap = len(q_content & s_content)
+    coverage = overlap / len(q_content) if q_content else 0.0
+    precision = overlap / len(s_content) if s_content else 0.0
+
+    anchors = q3_named_anchors(question)
+    sentence_tokens = set(q3_stems(sentence))
+    anchor_coverages: list[float] = []
+    for anchor in anchors:
+        a = set(q3_stems(anchor))
+        if a:
+            anchor_coverages.append(len(a & sentence_tokens) / len(a))
+    anchor_score = sum(anchor_coverages) / len(anchor_coverages) if anchor_coverages else 0.0
+    all_anchors_present = 1.0 if not anchor_coverages or all(x >= 0.999 for x in anchor_coverages) else 0.0
+
+    q_rel = q3_relation_keys(question)
+    s_rel = q3_relation_keys(sentence)
+    relation_score = len(q_rel & s_rel) / len(q_rel) if q_rel else 1.0
+
+    answer_type = q3_answer_type(question)
+    type_score = q3_type_evidence(answer_type, sentence, anchors)
+
+    # Anchor and answer-type evidence dominate generic word overlap. This avoids
+    # citing a different technology merely because it shares words like "released".
+    score = (
+        0.34 * coverage
+        + 0.12 * precision
+        + 0.26 * anchor_score
+        + 0.12 * all_anchors_present
+        + 0.10 * relation_score
+        + 0.18 * type_score
+    )
+    details = {
+        "coverage": coverage,
+        "precision": precision,
+        "anchor_score": anchor_score,
+        "all_anchors_present": all_anchors_present,
+        "relation_score": relation_score,
+        "type_score": type_score,
+        "overlap": float(overlap),
+        "q_terms": float(len(q_content)),
+        "has_anchors": 1.0 if anchors else 0.0,
+        "has_relations": 1.0 if q_rel else 0.0,
+    }
+    return score, details
 
 
 @app.post("/grounded-answer", response_model=GroundedResponse)
 def grounded_answer(request: GroundedRequest) -> GroundedResponse:
     if not request.chunks:
-        return GroundedResponse(
-            answer="I don't know", citations=[], confidence=0.0, answerable=False
-        )
+        return GroundedResponse(answer="I don't know", citations=[], confidence=0.0, answerable=False)
 
-    ranked: list[tuple[float, float, int, str, str]] = []
+    ranked: list[tuple[float, str, str, dict[str, float]]] = []
     for chunk in request.chunks:
         for sentence in sentence_candidates(chunk):
-            score, coverage, overlap = q3_candidate_score(request.question, sentence)
-            ranked.append((score, coverage, overlap, chunk.chunk_id, sentence))
+            score, details = q3_candidate_score(request.question, sentence)
+            ranked.append((score, chunk.chunk_id, sentence, details))
 
-    ranked.sort(key=lambda x: (-x[0], -x[1], -x[2], x[3], x[4]))
-    best_score, best_coverage, best_overlap, best_id, best_sentence = ranked[0]
-
-    q_lower = request.question.lower()
-    requires_year = bool(re.search(r"\b(what|which)\s+year\b|\bwhen\b", q_lower))
-    requires_number = bool(re.search(r"\bhow many\b|\bwhat (?:percent|percentage|amount|number)\b", q_lower))
-    format_ok = True
-    if requires_year:
-        format_ok = bool(re.search(r"\b(?:19|20)\d{2}\b", best_sentence))
-    elif requires_number:
-        format_ok = bool(re.search(r"\b\d+(?:\.\d+)?%?\b", best_sentence))
-
-    # Require meaningful evidence, not a single accidental shared word.
-    answerable = format_ok and (
-        best_coverage >= 0.42 or (best_overlap >= 2 and best_coverage >= 0.28)
+    ranked.sort(
+        key=lambda x: (
+            -x[0],
+            -x[3]["all_anchors_present"],
+            -x[3]["relation_score"],
+            -x[3]["coverage"],
+            -x[3]["precision"],
+            x[1],
+            x[2],
+        )
     )
+    best_score, best_id, best_sentence, d = ranked[0]
+
+    # Strict support gate. Named anchors must be present in the cited sentence.
+    # Questions without named anchors need at least two meaningful matching terms.
+    anchor_ok = not d["has_anchors"] or d["all_anchors_present"] == 1.0
+    relation_ok = not d["has_relations"] or d["relation_score"] >= 0.5
+    type_ok = d["type_score"] > 0.0
+    lexical_ok = (
+        (d["overlap"] >= 2 and d["coverage"] >= 0.30)
+        or (d["overlap"] >= 1 and d["coverage"] >= 0.45 and anchor_ok)
+        or (d["has_anchors"] and anchor_ok and relation_ok and type_ok)
+    )
+    answerable = anchor_ok and relation_ok and type_ok and lexical_ok and best_score >= 0.55
 
     if not answerable:
         return GroundedResponse(
             answer="I don't know",
             citations=[],
-            confidence=round(min(0.30, max(0.05, best_score * 0.30)), 2),
+            confidence=round(min(0.30, max(0.0, best_score * 0.25)), 2),
             answerable=False,
         )
 
-    confidence = min(0.99, max(0.65, 0.62 + 0.33 * min(best_score, 1.0)))
+    # Return the exact supporting sentence and only its real chunk ID. This makes
+    # the citation directly verifiable and prevents unsupported extra citations.
+    confidence = min(0.99, max(0.70, 0.58 + 0.38 * min(best_score, 1.0)))
     return GroundedResponse(
         answer=best_sentence,
         citations=[best_id],
@@ -343,141 +473,299 @@ class ExtractGraphResponse(BaseModel):
     relationships: list[Relationship]
 
 
-CAPITALIZED_PHRASE = re.compile(
-    r"\b(?:[A-Z][A-Za-z0-9+#-]*|[A-Z]{2,}[A-Za-z0-9+#-]*)"
-    r"(?:[ \t]+(?:[A-Z][A-Za-z0-9+#-]*|[A-Z]{2,}[A-Za-z0-9+#-]*))*\b"
+# Proper-name spans may contain connectors such as "of" (University of Toronto).
+ENTITY_MENTION_RE = re.compile(
+    r"\b(?:[A-Z][A-Za-z0-9+#'-]*|[A-Z]{2,}[A-Za-z0-9+#'-]*)"
+    r"(?:[ \t]+(?:(?:of|the|and|for|in)[ \t]+)?(?:[A-Z][A-Za-z0-9+#'-]*|[A-Z]{2,}[A-Za-z0-9+#'-]*))*\b"
 )
+ENTITY_NOISE = {
+    "The", "A", "An", "This", "It", "He", "She", "They", "Later", "After",
+    "Before", "During", "Meanwhile", "Framework", "Product", "Company",
+    "Organization", "Person", "Author", "Developer", "Founder",
+}
+KNOWN_ORGANIZATIONS = {
+    "openai", "google", "google deepmind", "microsoft", "meta", "facebook",
+    "facebook ai research", "anthropic", "hugging face", "amazon", "apple",
+    "ibm", "nvidia", "deepmind", "github",
+}
+KNOWN_FRAMEWORKS = {
+    "langchain", "tensorflow", "pytorch", "django", "react", "keras", "fastapi",
+    "llamaindex", "haystack", "transformers", "scikit-learn", "spring",
+}
 
-RELATION_PATTERNS: list[tuple[str, re.Pattern[str], bool]] = [
-    # Passive patterns must come first so "X was created by Y" has direction Y -> X.
-    ("FOUNDED", re.compile(r"(?P<tgt>.+?)\s+was\s+(?:founded|established)\s+by\s+(?P<src>.+)", re.I), False),
-    ("CREATED", re.compile(r"(?P<tgt>.+?)\s+was\s+(?:created|built)\s+by\s+(?P<src>.+)", re.I), False),
-    ("DEVELOPED", re.compile(r"(?P<tgt>.+?)\s+was\s+developed\s+by\s+(?P<src>.+)", re.I), False),
-    ("AUTHORED", re.compile(r"(?P<tgt>.+?)\s+was\s+(?:authored|written)\s+by\s+(?P<src>.+)", re.I), False),
-    ("FOUNDED", re.compile(r"(?P<src>.+?)\s+(?:founded|established)\s+(?P<tgt>.+)", re.I), False),
-    ("CREATED", re.compile(r"(?P<src>.+?)\s+(?:created|built)\s+(?P<tgt>.+)", re.I), False),
-    ("DEVELOPED", re.compile(r"(?P<src>.+?)\s+developed\s+(?P<tgt>.+)", re.I), False),
-    ("HIRED", re.compile(r"(?P<src>.+?)\s+hired\s+(?P<tgt>.+)", re.I), False),
-    ("AUTHORED", re.compile(r"(?P<src>.+?)\s+(?:authored|wrote)\s+(?P<tgt>.+)", re.I), False),
-    ("INTEGRATED_INTO", re.compile(r"(?P<src>.+?)\s+(?:integrates|integrated|works)\s+(?:with|into)\s+(?P<tgt>.+)", re.I), False),
-    ("INTEGRATED_INTO", re.compile(r"(?P<src>.+?)\s+is\s+integrated\s+(?:with|into)\s+(?P<tgt>.+)", re.I), False),
+
+def clean_entity_name(value: str) -> str | None:
+    value = value.strip().strip(" ,;:.!?()[]{}\"'")
+    value = re.sub(r"^(?:the|a|an)\s+", "", value, flags=re.I)
+    # Strip role prefixes but keep the actual proper name.
+    value = re.sub(
+        r"^(?:company|organization|framework|product|platform|library|tool|model|database)\s+(?:called|named)?\s*",
+        "",
+        value,
+        flags=re.I,
+    )
+    mentions = ENTITY_MENTION_RE.findall(value)
+    if not mentions:
+        return None
+    candidate = mentions[-1].strip()
+    candidate = re.sub(r"^(?:The|A|An)\s+", "", candidate)
+    return None if candidate in ENTITY_NOISE else candidate
+
+
+def entity_mentions(text: str) -> list[tuple[str, int, int]]:
+    result: list[tuple[str, int, int]] = []
+    for m in ENTITY_MENTION_RE.finditer(text):
+        name = clean_entity_name(m.group(0))
+        if name:
+            # Adjusted positions are unnecessary for nearest-neighbour use; the
+            # original span positions are deterministic and sufficient.
+            result.append((name, m.start(), m.end()))
+    return result
+
+
+def nearest_entity_before(text: str, position: int) -> str | None:
+    candidates = [m for m in entity_mentions(text) if m[2] <= position]
+    return candidates[-1][0] if candidates else None
+
+
+def nearest_entity_after(text: str, position: int) -> str | None:
+    candidates = [m for m in entity_mentions(text) if m[1] >= position]
+    return candidates[0][0] if candidates else None
+
+
+def explicit_type_hints(text: str) -> dict[str, EntityType]:
+    hints: dict[str, EntityType] = {}
+    role_words: list[tuple[EntityType, str]] = [
+        ("Framework", r"framework|library"),
+        ("Organization", r"company|organization|startup|laboratory|lab"),
+        ("Product", r"product|platform|tool|model|database|application|app"),
+    ]
+    for name, _, _ in entity_mentions(text):
+        escaped = re.escape(name)
+        for entity_type, role in role_words:
+            if re.search(
+                rf"\b{escaped}\b\s*(?:,|is|was)?\s*(?:an?|the)?\s*(?:{role})\b"
+                rf"|\b(?:{role})\b\s+(?:called|named)?\s*\b{escaped}\b",
+                text,
+                flags=re.I,
+            ):
+                hints[name] = entity_type
+    return hints
+
+
+def split_graph_clauses(text: str) -> list[tuple[str, str | None]]:
+    """Return (clause, pronoun-kind) pairs while preserving coordination."""
+    clauses: list[tuple[str, str | None]] = []
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    relation_start = (
+        r"(?:was |is )?(?:founded|established|created|built|designed|developed|"
+        r"integrated|integrates|works|hired|employed|recruited|authored|wrote|written)"
+    )
+    for sentence in sentences:
+        # Split relative clauses first, retaining whether they refer to the prior object.
+        relative_parts = re.split(r",\s*(who|which)\s+", sentence, flags=re.I)
+        current_kind: str | None = None
+        for i, part in enumerate(relative_parts):
+            if i % 2 == 1:
+                current_kind = part.lower()
+                continue
+            for sub in re.split(
+                rf"\s*(?:;|,\s+and\s+|\s+and\s+(?=(?:it\s+|the\s+\w+\s+)?{relation_start}\b))\s*",
+                part,
+                flags=re.I,
+            ):
+                if sub.strip():
+                    clauses.append((sub.strip(), current_kind))
+                    current_kind = None
+    return clauses
+
+
+PASSIVE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("FOUNDED", re.compile(r"\b(?:was|is)\s+(?:founded|established)\s+by\b", re.I)),
+    ("CREATED", re.compile(r"\b(?:was|is)\s+(?:created|built|designed)\s+by\b", re.I)),
+    ("DEVELOPED", re.compile(r"\b(?:was|is)\s+developed\s+by\b", re.I)),
+    ("AUTHORED", re.compile(r"\b(?:was|is)\s+(?:authored|written)\s+by\b", re.I)),
+]
+ACTIVE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("FOUNDED", re.compile(r"\b(?:founded|established)\b", re.I)),
+    ("CREATED", re.compile(r"\b(?:created|built|designed)\b", re.I)),
+    ("DEVELOPED", re.compile(r"\bdeveloped\b", re.I)),
+    ("HIRED", re.compile(r"\b(?:hired|employed|recruited)\b", re.I)),
+    ("AUTHORED", re.compile(r"\b(?:authored|wrote)\b", re.I)),
+    ("INTEGRATED_INTO", re.compile(r"\b(?:integrates?|integrated|works)\s+(?:with|into)\b", re.I)),
+    ("INTEGRATED_INTO", re.compile(r"\b(?:was|is)\s+integrated\s+(?:with|into)\b", re.I)),
+]
+NOMINAL_RELATIONS: list[tuple[str, str]] = [
+    ("FOUNDED", "founder"),
+    ("CREATED", "creator"),
+    ("DEVELOPED", "developer"),
+    ("AUTHORED", "author"),
 ]
 
 
-def clean_entity_fragment(fragment: str) -> str | None:
-    fragment = re.sub(r"^[\s,;:]+|[\s,;:.]+$", "", fragment)
-    fragment = re.sub(r"^(?:the|a|an)\s+", "", fragment, flags=re.I)
-    candidates = CAPITALIZED_PHRASE.findall(fragment)
-    if not candidates:
+def add_relationship(
+    relationships: list[Relationship], names: set[str], source: str | None,
+    target: str | None, relation: str,
+) -> Relationship | None:
+    if not source or not target or source == target:
         return None
-    # The last capitalized phrase near the verb is typically the subject/object.
-    candidate = candidates[-1].strip()
-    blocked = {"The", "A", "An", "It", "This", "Framework", "Product", "Company"}
-    return None if candidate in blocked else candidate
-
-
-def infer_entity_type(name: str, text: str, role_hint: str | None = None) -> EntityType:
-    lower_name = name.lower()
-    lower_text = text.lower()
-    if role_hint == "person":
-        return "Person"
-    if role_hint == "organization":
-        return "Organization"
-    if any(key in lower_name for key in ("openai", "google", "microsoft", "meta", "facebook", "anthropic", "systems", "labs", "research", "inc", "corp")):
-        return "Organization"
-    if re.search(rf"\b{re.escape(name.lower())}\b[^.!?]{{0,35}}\b(?:company|organization|startup|laboratory|lab)\b", lower_text):
-        return "Organization"
-    if any(key in lower_name for key in ("langchain", "tensorflow", "pytorch", "django", "react", "framework", "library")):
-        return "Framework"
-    if re.search(rf"\b(?:framework|library)\b[^.!?]{{0,35}}\b{re.escape(name.lower())}\b|\b{re.escape(name.lower())}\b[^.!?]{{0,35}}\b(?:framework|library)\b", lower_text):
-        return "Framework"
-    if re.search(rf"\b(?:product|platform|model|database|tool)\b[^.!?]{{0,35}}\b{re.escape(name.lower())}\b|\b{re.escape(name.lower())}\b[^.!?]{{0,35}}\b(?:product|platform|model|database|tool)\b", lower_text):
-        return "Product"
-    # Two or three ordinary title-cased words are most often a person's name.
-    words = name.split()
-    if 2 <= len(words) <= 4 and all(re.match(r"^[A-Z][a-z]+(?:-[A-Z][a-z]+)?$", w) for w in words):
-        return "Person"
-    return "Product"
-
-
-def split_clauses(text: str) -> list[str]:
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    clauses: list[str] = []
-    relation_start = r"(?:integrates?|is integrated|works|hired|authored|wrote|developed|created|built|founded|established)"
-    for sentence in sentences:
-        parts = re.split(rf"\s*(?:;|,\s+and\s+|\s+and\s+(?={relation_start}\b))\s*", sentence, flags=re.I)
-        clauses.extend(parts)
-    return [c.strip() for c in clauses if c.strip()]
+    rel = Relationship(source=source, target=target, relation=relation)
+    names.update((source, target))
+    if rel not in relationships:
+        relationships.append(rel)
+    return rel
 
 
 @app.post("/extract-graph", response_model=ExtractGraphResponse)
 def extract_graph(request: ExtractGraphRequest) -> ExtractGraphResponse:
     relationships: list[Relationship] = []
-    names: set[str] = set(CAPITALIZED_PHRASE.findall(request.text))
-
-    # Remove sentence-initial noise words.
-    names = {n for n in names if n not in {"The", "A", "An", "This", "It"}}
+    mentions = entity_mentions(request.text)
+    names: set[str] = {name for name, _, _ in mentions}
+    hints = explicit_type_hints(request.text)
 
     carried_subject: str | None = None
-    for clause in split_clauses(request.text):
-        normalized_clause = clause.strip().rstrip(".!?")
-        # Handle an omitted subject in coordinated clauses, e.g.
-        # "LangChain was created by Harrison Chase and integrates with OpenAI."
-        if carried_subject and re.match(
-            r"^(?:integrates?|is integrated|works|hired|authored|wrote|developed|created|built|founded|established)\b",
-            normalized_clause,
+    previous_object: str | None = None
+    last_by_type: dict[str, str] = {}
+
+    for raw_clause, relative_kind in split_graph_clauses(request.text):
+        clause = raw_clause.strip().rstrip(".!?")
+
+        # Resolve lightweight coreference used by the seeded test sentences.
+        prefix_subject: str | None = None
+        if relative_kind in {"who", "which"}:
+            prefix_subject = previous_object
+        elif re.match(r"^(?:it|this)\b", clause, flags=re.I):
+            prefix_subject = carried_subject
+            clause = re.sub(r"^(?:it|this)\b", "", clause, flags=re.I).strip()
+        else:
+            role_match = re.match(r"^the\s+(company|organization|framework|product|platform|tool)\b", clause, flags=re.I)
+            if role_match:
+                role = role_match.group(1).lower()
+                lookup = "Organization" if role in {"company", "organization"} else "Framework" if role == "framework" else "Product"
+                prefix_subject = last_by_type.get(lookup) or carried_subject
+                clause = clause[role_match.end():].strip()
+
+        if prefix_subject and not entity_mentions(clause[: max(1, len(clause) // 3)]):
+            clause = f"{prefix_subject} {clause}"
+        elif carried_subject and re.match(
+            r"^(?:was |is )?(?:founded|established|created|built|designed|developed|integrated|integrates|works|hired|employed|recruited|authored|wrote)\b",
+            clause,
             flags=re.I,
         ):
-            normalized_clause = f"{carried_subject} {normalized_clause}"
+            clause = f"{carried_subject} {clause}"
 
-        matched_relationship: Relationship | None = None
-        for relation, pattern, _ in RELATION_PATTERNS:
-            match = pattern.fullmatch(normalized_clause)
-            if not match:
-                continue
-            src = clean_entity_fragment(match.group("src"))
-            tgt = clean_entity_fragment(match.group("tgt"))
-            if src and tgt and src != tgt:
-                names.update((src, tgt))
-                matched_relationship = Relationship(source=src, target=tgt, relation=relation)
-                if matched_relationship not in relationships:
-                    relationships.append(matched_relationship)
-            break
+        matched: Relationship | None = None
 
-        if matched_relationship:
-            # For passive creation/development, the described subject is the target.
-            # For integration and active clauses, it is usually the source.
-            carried_subject = (
-                matched_relationship.source
-                if matched_relationship.relation in {"INTEGRATED_INTO", "HIRED"}
-                else matched_relationship.target
-            )
+        # Nominal forms: "Alice is the founder of Acme".
+        for relation, noun in NOMINAL_RELATIONS:
+            m = re.search(rf"\b(?:is|was)\s+(?:the|a|an)\s+{noun}\s+of\b", clause, flags=re.I)
+            if m:
+                matched = add_relationship(
+                    relationships, names,
+                    nearest_entity_before(clause, m.start()),
+                    nearest_entity_after(clause, m.end()),
+                    relation,
+                )
+                break
+            m = re.search(rf"\b{noun}\s+(?:is|was)\b", clause, flags=re.I)
+            if m:
+                # "Acme's founder is Alice": target before noun, source after is.
+                matched = add_relationship(
+                    relationships, names,
+                    nearest_entity_after(clause, m.end()),
+                    nearest_entity_before(clause, m.start()),
+                    relation,
+                )
+                break
+
+        if not matched:
+            for relation, pattern in PASSIVE_PATTERNS:
+                m = pattern.search(clause)
+                if not m:
+                    continue
+                target = nearest_entity_before(clause, m.start())
+                source = nearest_entity_after(clause, m.end())
+                matched = add_relationship(relationships, names, source, target, relation)
+                break
+
+        if not matched:
+            for relation, pattern in ACTIVE_PATTERNS:
+                m = pattern.search(clause)
+                if not m:
+                    continue
+                source = nearest_entity_before(clause, m.start())
+                target = nearest_entity_after(clause, m.end())
+                matched = add_relationship(relationships, names, source, target, relation)
+                break
+
+        if matched:
+            previous_object = matched.target
+            if matched.relation in {"FOUNDED", "CREATED", "DEVELOPED", "AUTHORED"}:
+                # Passive and active forms both describe the target in follow-up
+                # clauses such as "and integrates with OpenAI".
+                carried_subject = matched.target
+            else:
+                carried_subject = matched.source
         else:
-            phrase_candidates = CAPITALIZED_PHRASE.findall(normalized_clause)
-            if phrase_candidates:
-                carried_subject = phrase_candidates[0]
+            clause_mentions = entity_mentions(clause)
+            if clause_mentions:
+                carried_subject = clause_mentions[0][0]
+                previous_object = clause_mentions[-1][0]
 
-    # Infer stronger role hints from relations.
-    person_names: set[str] = set()
-    org_names: set[str] = set()
+    # Relationship roles provide strong deterministic type hints.
     for rel in relationships:
-        if rel.relation in {"CREATED", "FOUNDED", "DEVELOPED", "AUTHORED"}:
-            # A two-word source is likely a person; a known company name remains an org.
-            if len(rel.source.split()) >= 2 and not any(
-                x in rel.source.lower() for x in ("openai", "google", "microsoft", "meta", "facebook", "labs", "systems")
-            ):
-                person_names.add(rel.source)
-        if rel.relation == "HIRED":
-            org_names.add(rel.source)
-            person_names.add(rel.target)
+        src_lower, tgt_lower = rel.source.lower(), rel.target.lower()
+        if rel.relation == "FOUNDED":
+            hints.setdefault(rel.source, "Organization" if src_lower in KNOWN_ORGANIZATIONS else "Person")
+            hints.setdefault(rel.target, "Organization")
+        elif rel.relation == "HIRED":
+            hints.setdefault(rel.source, "Organization")
+            hints.setdefault(rel.target, "Person")
+        elif rel.relation == "AUTHORED":
+            hints.setdefault(rel.source, "Person")
+            hints.setdefault(rel.target, "Product")
+        elif rel.relation in {"CREATED", "DEVELOPED"}:
+            if src_lower in KNOWN_ORGANIZATIONS:
+                hints.setdefault(rel.source, "Organization")
+            elif len(rel.source.split()) >= 2:
+                hints.setdefault(rel.source, "Person")
+            hints.setdefault(rel.target, "Framework" if tgt_lower in KNOWN_FRAMEWORKS else "Product")
+        elif rel.relation == "INTEGRATED_INTO":
+            hints.setdefault(rel.source, "Framework" if src_lower in KNOWN_FRAMEWORKS else "Product")
+            if tgt_lower in KNOWN_ORGANIZATIONS:
+                hints.setdefault(rel.target, "Organization")
 
-    entities: list[Entity] = []
-    for name in sorted(names):
-        if len(name) <= 1:
-            continue
-        hint = "person" if name in person_names else "organization" if name in org_names else None
-        entities.append(Entity(name=name, type=infer_entity_type(name, request.text, hint)))
+    def infer(name: str) -> EntityType:
+        if name in hints:
+            return hints[name]
+        lower = name.lower()
+        if lower in KNOWN_ORGANIZATIONS or any(x in lower for x in (" inc", " corp", " systems", " labs", " research")):
+            return "Organization"
+        if lower in KNOWN_FRAMEWORKS or any(x in lower for x in ("framework", "library")):
+            return "Framework"
+        words = name.split()
+        if 2 <= len(words) <= 4 and all(re.match(r"^[A-Z][a-z]+(?:-[A-Z][a-z]+)?$", w) for w in words):
+            return "Person"
+        return "Product"
 
+    relation_names = {x for r in relationships for x in (r.source, r.target)}
+    filtered_names: list[str] = []
+    for name in names:
+        # Keep all relation participants. For standalone mentions, require a
+        # strong proper-name signal to avoid sentence-initial noise words.
+        strong = (
+            name in relation_names
+            or name in hints
+            or name.lower() in KNOWN_ORGANIZATIONS
+            or name.lower() in KNOWN_FRAMEWORKS
+            or len(name.split()) >= 2
+            or bool(re.search(r"[A-Z].*[A-Z]|\d", name))
+        )
+        if strong and name not in ENTITY_NOISE:
+            filtered_names.append(name)
+
+    entities = [Entity(name=name, type=infer(name)) for name in sorted(set(filtered_names))]
+    relationships.sort(key=lambda r: (r.source, r.target, r.relation))
     return ExtractGraphResponse(entities=entities, relationships=relationships)
 
 
@@ -499,9 +787,9 @@ class GraphQueryResponse(BaseModel):
 
 RELATION_WORDS: list[tuple[str, re.Pattern[str]]] = [
     ("FOUNDED", re.compile(r"\b(?:founded|founder|established)\b", re.I)),
-    ("CREATED", re.compile(r"\b(?:created|creator|built|invented)\b", re.I)),
+    ("CREATED", re.compile(r"\b(?:created|creator|built|designed|invented)\b", re.I)),
     ("DEVELOPED", re.compile(r"\b(?:developed|developer)\b", re.I)),
-    ("INTEGRATED_INTO", re.compile(r"\b(?:integrates?|integrated|works? with|connected)\b", re.I)),
+    ("INTEGRATED_INTO", re.compile(r"\b(?:integrates?|integrated|works? with|connected|compatible)\b", re.I)),
     ("HIRED", re.compile(r"\b(?:hired|employed|recruited)\b", re.I)),
     ("AUTHORED", re.compile(r"\b(?:authored|wrote|written|author)\b", re.I)),
 ]
@@ -518,13 +806,13 @@ def relation_clues(question: str) -> list[str]:
 
 def requested_type(question: str) -> str | None:
     q = question.lower()
-    if "who" in q or "which person" in q:
+    if re.search(r"\bwho\b|\bwhich person\b", q):
         return "Person"
-    if "which organization" in q or "what organization" in q or "which company" in q:
+    if re.search(r"\b(?:which|what)\s+(?:organization|company)\b", q):
         return "Organization"
-    if "which framework" in q or "what framework" in q:
+    if re.search(r"\b(?:which|what)\s+(?:framework|library)\b", q):
         return "Framework"
-    if "which product" in q or "what product" in q:
+    if re.search(r"\b(?:which|what)\s+(?:product|platform|tool|model|database)\b", q):
         return "Product"
     return None
 
@@ -546,49 +834,56 @@ def graph_query(request: GraphQueryRequest) -> GraphQueryResponse:
 
     adjacency: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for rel in request.graph.relationships:
-        adjacency[rel.source].append((rel.target, rel.relation.upper()))
-        adjacency[rel.target].append((rel.source, rel.relation.upper()))
+        relation = rel.relation.upper()
+        adjacency[rel.source].append((rel.target, relation))
+        adjacency[rel.target].append((rel.source, relation))
 
     starts = anchors or sorted(entities)
 
-    # First try exact multi-hop relation matching, from a named anchor outward.
+    # Match the relation sequence exactly from the named anchor outward. Natural
+    # language states the answer-side relation first, hence the reversal above.
     if desired_relations:
+        valid_paths: list[tuple[str, list[str]]] = []
         for start in starts:
             stack: list[tuple[str, int, list[str], set[str]]] = [(start, 0, [start], {start})]
             while stack:
                 node, idx, path, visited = stack.pop()
                 if idx == len(desired_relations):
-                    if len(path) > 1 and (desired_type is None or entities.get(node, Entity(name=node, type="Product")).type == desired_type):
-                        return GraphQueryResponse(answer=node, reasoning_path=path, hops=len(path) - 1)
+                    entity = entities.get(node)
+                    if len(path) > 1 and entity and (desired_type is None or entity.type == desired_type):
+                        valid_paths.append((node, path))
                     continue
                 wanted = desired_relations[idx]
-                for neighbor, relation in sorted(adjacency.get(node, []), reverse=True):
+                for neighbor, relation in sorted(adjacency.get(node, []), key=lambda x: (x[0], x[1]), reverse=True):
                     if neighbor not in visited and relation == wanted:
                         stack.append((neighbor, idx + 1, path + [neighbor], visited | {neighbor}))
+        if valid_paths:
+            answer, path = sorted(valid_paths, key=lambda x: (x[0], x[1]))[0]
+            return GraphQueryResponse(answer=answer, reasoning_path=path, hops=len(path) - 1)
 
-    # Fallback: shortest path using only relations mentioned in the question.
+    # Fallback to the shortest type-compatible path using mentioned relations.
     allowed = set(clues)
-    best: tuple[int, list[str], str] | None = None
+    candidates: list[tuple[int, str, list[str]]] = []
     for start in starts:
         queue = deque([(start, [start])])
         seen = {start}
         while queue:
             node, path = queue.popleft()
-            if len(path) > 1 and (desired_type is None or entities.get(node, Entity(name=node, type="Product")).type == desired_type):
-                candidate = (len(path) - 1, path, node)
-                if best is None or (candidate[0], candidate[2]) < (best[0], best[2]):
-                    best = candidate
+            entity = entities.get(node)
+            if len(path) > 1 and entity and (desired_type is None or entity.type == desired_type):
+                candidates.append((len(path) - 1, node, path))
                 break
-            if len(path) - 1 >= 4:
+            if len(path) - 1 >= 5:
                 continue
-            for neighbor, relation in sorted(adjacency.get(node, [])):
+            for neighbor, relation in sorted(adjacency.get(node, []), key=lambda x: (x[0], x[1])):
                 if neighbor in seen or (allowed and relation not in allowed):
                     continue
                 seen.add(neighbor)
                 queue.append((neighbor, path + [neighbor]))
 
-    if best:
-        return GraphQueryResponse(answer=best[2], reasoning_path=best[1], hops=best[0])
+    if candidates:
+        hops, answer, path = sorted(candidates, key=lambda x: (x[0], x[1], x[2]))[0]
+        return GraphQueryResponse(answer=answer, reasoning_path=path, hops=hops)
     return GraphQueryResponse(answer="I don't know", reasoning_path=[], hops=0)
 
 
@@ -625,7 +920,7 @@ def community_summary(request: CommunitySummaryRequest) -> CommunitySummaryRespo
     unique_entities = list(dict.fromkeys(request.entities))
     relation_sentences = [relationship_sentence(r) for r in request.relationships]
     if relation_sentences:
-        summary = "; ".join(relation_sentences) + "."
+        summary = "This community includes " + "; ".join(relation_sentences) + "."
     elif unique_entities:
         summary = "This community contains " + ", ".join(unique_entities) + "."
     else:
