@@ -27,12 +27,20 @@ A FastAPI service for grounded question answering, vector similarity search, and
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+pip install -r requirements-dev.txt
 uvicorn main:app --reload
 ```
 
 Open `http://127.0.0.1:8000/docs` for the interactive OpenAPI interface.
+
+## Tests and CI
+
+Pytest covers core similarity behaviour and API endpoint discovery. GitHub Actions runs the tests on pushes to `main` and on pull requests.
+
+```bash
+pytest -q
+```
 
 ## Design notes
 
