@@ -1,16 +1,18 @@
 # Grounded RAG & Knowledge-Graph API
 
-A FastAPI service for grounded question answering, vector similarity search, and lightweight knowledge-graph extraction/querying. The project combines deterministic retrieval utilities with graph-oriented endpoints behind a single deployable API.
+A FastAPI service for grounded question answering, vector similarity search, and lightweight knowledge-graph extraction/querying.
+
+**This repository consolidates and updates related work for easier maintenance and reference.**
 
 ## Capabilities
 
-- **Grounded answering** — answer questions from supplied context chunks and return supporting citations, confidence, and answerability metadata.
-- **Vector search** — rank candidate items using cosine similarity.
-- **Knowledge-graph extraction** — identify entities and relations from source text.
-- **Graph querying** — query extracted relationships using structured requests.
-- **Community summaries** — produce higher-level summaries over graph communities.
-- **Input validation** — Pydantic models and validation for API contracts.
-- **Health endpoint** — deployment-friendly service health check.
+- **Grounded answering** — answer from supplied context chunks with citations, confidence, and answerability metadata
+- **Vector search** — cosine-similarity ranking
+- **Knowledge-graph extraction** — entities and relations from source text
+- **Graph querying** — structured relationship queries
+- **Community summaries** — higher-level graph summaries
+- **Input validation** — Pydantic request/response models
+- **Health endpoint** — deployment-friendly service check
 
 ## API surface
 
@@ -27,35 +29,27 @@ A FastAPI service for grounded question answering, vector similarity search, and
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn main:app --reload
 ```
 
-Open `http://127.0.0.1:8000/docs` for the interactive OpenAPI interface.
+Open `http://127.0.0.1:8000/docs` for the interactive API.
 
-## Tests and CI
-
-Pytest covers core similarity behaviour and API endpoint discovery. GitHub Actions runs the tests on pushes to `main` and on pull requests.
+## Tests
 
 ```bash
 pytest -q
 ```
 
-## Design notes
+## Design
 
-The implementation deliberately keeps several retrieval and scoring steps deterministic. This makes behaviour easier to inspect and test while still demonstrating core RAG concepts such as relevance scoring, grounded-answer selection, citations, vector similarity, entity/relation extraction, and graph traversal.
+Several retrieval and scoring steps are kept deterministic so behaviour is easy to inspect and test.
 
 ## Deployment
-
-The application is compatible with standard Python ASGI hosting. A typical start command is:
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port $PORT
 ```
 
 Use `/health` as the service health-check path.
-
-## Portfolio focus
-
-This repository is retained as an applied RAG/knowledge-graph engineering project. The public-facing documentation focuses on the system design and API behaviour rather than the original exercise context in which the implementation was developed.
